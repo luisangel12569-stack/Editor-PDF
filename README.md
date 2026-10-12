@@ -8,4 +8,4 @@ Usa [PDF.js](https://mozilla.github.io/pdf.js/) para mostrar el PDF y [pdf-lib](
 1. Visor web: abrir un PDF y ver sus páginas ✅
 2. Editar texto ✅
 3. Borrar y mover cuadros, imágenes y firmas ✅
-4. Guardar el PDF editado y publicar con GitHub Pages
+4. Borrado seguro y publicar con GitHub Pages ✅

@@ -51,6 +51,7 @@
   .actions { position:absolute; display:flex; gap:4px; z-index:5; }
   .actions button { padding:4px 10px; font-size:14px; box-shadow:0 1px 3px rgba(0,0,0,.25); }
   .actions .del { background:var(--danger); border-color:var(--danger); color:#fff; }
+  label.check { display:inline-flex; align-items:center; gap:4px; font-size:14px; cursor:pointer; }
 </style>
 </head>
 <body>
@@ -65,6 +66,9 @@
   <span id="zoomLabel">100%</span>
   <button id="zoomIn" title="Acercar">+</button>
   <button id="undo" disabled title="Deshacer el último cambio">Deshacer</button>
+  <label class="check" title="Las páginas con cambios se guardan como imagen: lo borrado o tapado ya no se puede recuperar, pero el texto de esas páginas deja de poder copiarse.">
+    <input id="secure" type="checkbox"> Borrado seguro
+  </label>
   <button id="download" class="primary" disabled>Descargar PDF</button>
   <span id="info"></span>
 </header>
@@ -491,7 +495,8 @@ async function download() {
     page.drawRectangle({ x: e.x - 1, y: e.y - e.size * 0.25, width: e.width + 2, height: e.size * 1.2, color: color(e.bg) });
     if (e.text) page.drawText(e.text, { x: e.x, y: e.y, size: e.size, font, color: color(e.fg) });
   }
-  const bytes = await doc.save();
+  let bytes = await doc.save();
+  if ($('secure').checked) bytes = await flattenChangedPages(bytes);
   const filename = state.name.replace(/\.pdf$/i, '') + '-editado.pdf';
   // Dentro de la vista previa de Claude la descarga pasa por su diálogo; en cualquier otra web, descarga normal.
   const claudeDownloads = window.claude?.use ? await window.claude.use('downloads') : null;
@@ -505,6 +510,32 @@ async function download() {
   a.download = filename;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// Borrado seguro: las páginas con cambios se vuelven una imagen, así lo tapado desaparece del archivo.
+// Se arma un PDF nuevo copiando solo lo necesario, para que no queden restos de las páginas viejas.
+async function flattenChangedPages(editedBytes) {
+  const { PDFDocument } = PDFLib;
+  const changed = new Set([...state.ops.map(o => o.page), ...[...state.edits.values()].map(e => e.page)]);
+  const src = await PDFDocument.load(editedBytes);
+  const out = await PDFDocument.create();
+  const preview = await pdfjsLib.getDocument({ data: editedBytes.slice() }).promise;
+  for (let n = 1; n <= src.getPageCount(); n++) {
+    if (!changed.has(n)) {
+      const [copy] = await out.copyPages(src, [n - 1]);
+      out.addPage(copy);
+      continue;
+    }
+    const page = await preview.getPage(n);
+    const viewport = page.getViewport({ scale: 2.5 }); // ~180 ppp: nítido al imprimir
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width; canvas.height = viewport.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    const img = await out.embedJpg(canvas.toDataURL('image/jpeg', 0.92));
+    const { width, height } = page.getViewport({ scale: 1 });
+    out.addPage([width, height]).drawImage(img, { x: 0, y: 0, width, height });
+  }
+  return out.save();
 }
 
 function zoom(delta) {
