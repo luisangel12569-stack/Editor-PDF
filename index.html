@@ -55,6 +55,18 @@
   #pagetools[hidden] { display:none; }
   #pagetools input[type=text], #pgRanges { font:inherit; padding:6px 8px; border:1px solid var(--border); border-radius:6px;
            background:var(--panel); color:var(--text); max-width:100%; }
+  #pages.grid { flex-direction:row; flex-wrap:wrap; justify-content:center; align-items:flex-start; }
+  .thumb { width:150px; display:flex; flex-direction:column; gap:4px; align-items:center; padding:6px; border-radius:8px;
+           cursor:grab; touch-action:none; user-select:none; }
+  .thumb canvas { display:block; background:#fff; box-shadow:0 1px 4px rgba(0,0,0,.25); max-width:100%; pointer-events:none; }
+  .thumb.marked canvas { outline:3px solid var(--accent); }
+  .thumb.dragging { opacity:.35; }
+  .thumb.drop-before { box-shadow:-4px 0 0 var(--accent); }
+  .thumb.drop-after { box-shadow:4px 0 0 var(--accent); }
+  .ghost { position:fixed; z-index:50; pointer-events:none; opacity:.85; transform:rotate(-3deg); }
+  .ghost .count { position:absolute; top:-8px; right:-8px; background:var(--accent); color:#fff; border-radius:12px;
+                  padding:2px 8px; font-size:13px; font-weight:bold; }
+  #pgOrganize.on { background:var(--accent); color:#fff; border-color:var(--accent); }
   .page-box { display:flex; flex-direction:column; gap:4px; flex:none; }
   .page-bar { display:flex; gap:6px; align-items:center; font-size:13px; color:var(--muted); }
   .page-bar button { padding:0 8px; font-size:13px; }
@@ -81,6 +93,7 @@
   <span id="info"></span>
   <div id="pagetools" hidden>
     <b>Páginas:</b>
+    <button id="pgOrganize" title="Ver miniaturas y arrastrar páginas para cambiar el orden">Organizar</button>
     <button id="pgAll">Marcar todas</button>
     <button id="pgDelete" class="needsel" title="Quita del documento las páginas marcadas">Eliminar</button>
     <button id="pgExtract" class="needsel" title="Descarga un PDF nuevo solo con las páginas marcadas">Extraer</button>
@@ -103,9 +116,10 @@ pdfjsLib.GlobalWorkerOptions.workerSrc =
 // edits: clave "página:índice" -> texto original (en unidades PDF) + texto nuevo.
 // ops: áreas borradas o movidas, en unidades PDF: {page, x, y, w, h, bg, dx, dy, png}. png solo si se movió.
 const state = { pdf: null, bytes: null, name: 'documento.pdf', scale: 1.0, mode: 'text',
-                edits: new Map(), ops: [], history: [], selected: new Set() };
+                edits: new Map(), ops: [], history: [], selected: new Set(), view: 'pages' };
 const $ = id => document.getElementById(id);
 const HINTS = {
+  grid: 'Arrastra una página para cambiarla de lugar. Si arrastras una página marcada, se mueven juntas todas las marcadas.',
   text: 'Haz clic en cualquier texto para cambiarlo. Pulsa Enter para confirmar o Esc para cancelar.',
   area: 'Arrastra para marcar un área (cuadro, firma, sello) o haz clic en una imagen marcada con línea punteada. Lo movido se puede arrastrar.',
 };
@@ -134,7 +148,9 @@ function setMode(mode) {
   document.body.classList.toggle('area', mode === 'area');
   $('modeText').classList.toggle('on', mode === 'text');
   $('modeArea').classList.toggle('on', mode === 'area');
-  $('hint').textContent = HINTS[mode];
+  $('hint').textContent = HINTS[state.view === 'grid' ? 'grid' : mode];
+  $('pgOrganize').classList.toggle('on', state.view === 'grid');
+  $('pgOrganize').textContent = state.view === 'grid' ? 'Volver a editar' : 'Organizar';
   document.querySelectorAll('.sel, .actions').forEach(el => el.remove());
 }
 
@@ -148,7 +164,9 @@ function showInfo() {
 }
 
 async function render() {
+  if (state.view === 'grid') return renderGrid();
   const container = $('pages');
+  container.classList.remove('grid');
   container.innerHTML = '';
   $('zoomLabel').textContent = Math.round(state.scale * 100) + '%';
   const ratio = window.devicePixelRatio || 1;
@@ -503,7 +521,7 @@ function updateButtons() {
   document.querySelectorAll('.needsel').forEach(b => { b.disabled = state.selected.size === 0; });
 }
 
-// Encima de cada página: casilla para marcarla y flechas para cambiarla de lugar.
+// Encima de cada página: casilla para marcarla.
 function pageBox(n, wrap) {
   const box = document.createElement('div');
   box.className = 'page-box' + (state.selected.has(n) ? ' marked' : '');
@@ -517,17 +535,7 @@ function pageBox(n, wrap) {
     box.classList.toggle('marked', e.target.checked);
     updateButtons();
   });
-  const arrow = (label, title, to) => {
-    const b = document.createElement('button');
-    b.textContent = label;
-    b.title = title;
-    b.disabled = to < 1 || to > state.pdf.numPages;
-    b.addEventListener('click', () => movePage(n, to).catch(showError));
-    bar.appendChild(b);
-  };
   bar.appendChild(check);
-  arrow('↑', 'Subir esta página', n - 1);
-  arrow('↓', 'Bajar esta página', n + 1);
   box.append(bar, wrap);
   return box;
 }
@@ -551,12 +559,12 @@ async function editedDoc() {
   return PDFLib.PDFDocument.load(await buildEditedBytes());
 }
 
-async function replaceDocument(bytes) {
+async function replaceDocument(bytes, selected = []) {
   remember();
   state.bytes = bytes;
   state.edits = new Map();
   state.ops = [];
-  state.selected.clear();
+  state.selected = new Set(selected);
   state.pdf = await pdfjsLib.getDocument({ data: state.bytes.slice() }).promise;
   showInfo();
   updateButtons();
@@ -593,14 +601,107 @@ async function addPdf(file) {
     [other, range(0, other.getPageCount())],
     [doc, range(after, total)],
   ]);
-  await replaceDocument(await out.save());
+  // Las páginas nuevas quedan marcadas y se abre Organizar, para arrastrarlas a donde se quiera.
+  state.view = 'grid';
+  setMode(state.mode);
+  await replaceDocument(await out.save(), range(after + 1, after + other.getPageCount() + 1));
 }
 
-async function movePage(from, to) {
+// Mueve las páginas `moving` (números desde 1) para que queden antes de la página `before`
+// (o al final si before = total + 1).
+async function movePages(moving, before) {
+  const total = state.pdf.numPages;
+  const rest = range(1, total + 1).filter(n => !moving.includes(n));
+  const at = rest.filter(n => n < before).length;
+  const order = [...rest.slice(0, at), ...moving, ...rest.slice(at)];
+  if (order.every((n, i) => n === i + 1)) { render(); return; }
   const doc = await editedDoc();
-  const order = range(0, doc.getPageCount());
-  [order[from - 1], order[to - 1]] = [order[to - 1], order[from - 1]];
-  await replaceDocument(await (await pagesToDoc([[doc, order]])).save());
+  const bytes = await (await pagesToDoc([[doc, order.map(n => n - 1)]])).save();
+  // Las páginas marcadas siguen marcadas en su nuevo lugar.
+  await replaceDocument(bytes, order.map((orig, i) => state.selected.has(orig) ? i + 1 : 0).filter(Boolean));
+}
+
+// Vista Organizar: miniaturas que se arrastran (con mouse o con el dedo).
+async function renderGrid() {
+  const container = $('pages');
+  container.innerHTML = '';
+  container.classList.add('grid');
+  for (let n = 1; n <= state.pdf.numPages; n++) {
+    const page = await state.pdf.getPage(n);
+    const viewport = page.getViewport({ scale: 138 / page.getViewport({ scale: 1 }).width });
+    const thumb = document.createElement('div');
+    thumb.className = 'thumb' + (state.selected.has(n) ? ' marked' : '');
+    thumb.dataset.page = n;
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width; canvas.height = viewport.height;
+    const check = document.createElement('label');
+    check.className = 'check';
+    check.innerHTML = `<input type="checkbox" ${state.selected.has(n) ? 'checked' : ''}> ${n}`;
+    check.addEventListener('pointerdown', e => e.stopPropagation());
+    check.querySelector('input').addEventListener('change', e => {
+      e.target.checked ? state.selected.add(n) : state.selected.delete(n);
+      thumb.classList.toggle('marked', e.target.checked);
+      updateButtons();
+    });
+    thumb.append(canvas, check);
+    container.appendChild(thumb);
+    thumb.addEventListener('pointerdown', e => startDrag(e, thumb, n));
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+  }
+}
+
+function startDrag(e, thumb, n) {
+  if (e.button > 0) return;
+  const start = { x: e.clientX, y: e.clientY };
+  const moving = state.selected.has(n) ? [...state.selected].sort((a, b) => a - b) : [n];
+  let ghost = null, target = null;
+  thumb.setPointerCapture(e.pointerId);
+  const clearMarks = () => document.querySelectorAll('.drop-before, .drop-after').forEach(t => t.classList.remove('drop-before', 'drop-after'));
+  const move = ev => {
+    if (!ghost) {
+      if (Math.hypot(ev.clientX - start.x, ev.clientY - start.y) < 6) return;
+      ghost = document.createElement('div');
+      ghost.className = 'ghost';
+      const img = thumb.querySelector('canvas').cloneNode();
+      img.getContext('2d').drawImage(thumb.querySelector('canvas'), 0, 0);
+      ghost.appendChild(img);
+      if (moving.length > 1) ghost.insertAdjacentHTML('beforeend', `<span class="count">${moving.length}</span>`);
+      document.body.appendChild(ghost);
+      moving.forEach(m => document.querySelector(`.thumb[data-page="${m}"]`)?.classList.add('dragging'));
+    }
+    ghost.style.left = (ev.clientX + 14) + 'px';
+    ghost.style.top = (ev.clientY + 14) + 'px';
+    if (ev.clientY < 70) window.scrollBy(0, -15);
+    if (ev.clientY > window.innerHeight - 50) window.scrollBy(0, 15);
+    // La página bajo el dedo decide el lugar: mitad izquierda = antes, mitad derecha = después.
+    const over = document.elementsFromPoint(ev.clientX, ev.clientY).find(el => el.classList?.contains('thumb'));
+    clearMarks();
+    if (over) {
+      const r = over.getBoundingClientRect();
+      const after = ev.clientX > r.left + r.width / 2;
+      over.classList.add(after ? 'drop-after' : 'drop-before');
+      target = +over.dataset.page + (after ? 1 : 0);
+    }
+  };
+  const up = () => {
+    thumb.removeEventListener('pointermove', move);
+    thumb.removeEventListener('pointerup', up);
+    thumb.removeEventListener('pointercancel', up);
+    clearMarks();
+    if (!ghost) return;
+    ghost.remove();
+    document.querySelectorAll('.dragging').forEach(t => t.classList.remove('dragging'));
+    if (target != null) movePages(moving, target).catch(showError);
+  };
+  thumb.addEventListener('pointermove', move);
+  thumb.addEventListener('pointerup', up);
+  thumb.addEventListener('pointercancel', up);
+}
+
+function toggleOrganize() {
+  state.view = state.view === 'grid' ? 'pages' : 'grid';
+  setMode(state.mode);
+  render();
 }
 
 // "1-3, 5, 7-8" -> [[1,2,3],[5],[7,8]]. Vacío = una parte por página.
@@ -724,6 +825,7 @@ $('modeArea').addEventListener('click', () => setMode('area'));
 $('zoomIn').addEventListener('click', () => zoom(0.25));
 $('zoomOut').addEventListener('click', () => zoom(-0.25));
 $('undo').addEventListener('click', () => undo().catch(showError));
+$('pgOrganize').addEventListener('click', toggleOrganize);
 $('pgAll').addEventListener('click', () => {
   const all = state.selected.size < state.pdf.numPages;
   state.selected = new Set(all ? range(1, state.pdf.numPages + 1) : []);
