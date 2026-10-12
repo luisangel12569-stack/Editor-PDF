@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Editor de PDF</title>
+<style>
+  :root { --bg:#f3f4f6; --panel:#ffffff; --text:#111827; --muted:#6b7280; --accent:#2563eb; --border:#e5e7eb; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#111827; --panel:#1f2937; --text:#f9fafb; --muted:#9ca3af; --accent:#60a5fa; --border:#374151; }
+  }
+  :root[data-theme="dark"] { --bg:#111827; --panel:#1f2937; --text:#f9fafb; --muted:#9ca3af; --accent:#60a5fa; --border:#374151; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { position:sticky; top:0; z-index:10; display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+           padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--border); }
+  header h1 { font-size:18px; margin:0 12px 0 0; }
+  button, label.btn { font:inherit; padding:6px 12px; border:1px solid var(--border); border-radius:6px;
+           background:var(--panel); color:var(--text); cursor:pointer; }
+  label.btn.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  #info { color:var(--muted); font-size:14px; margin-left:auto; }
+  #drop { margin:32px 16px; padding:48px 16px; border:2px dashed var(--border); border-radius:12px;
+          text-align:center; color:var(--muted); }
+  #drop.over { border-color:var(--accent); color:var(--accent); }
+  #pages { display:flex; flex-direction:column; align-items:center; gap:16px; padding:16px; }
+  .page { position:relative; background:#fff; box-shadow:0 1px 4px rgba(0,0,0,.25); max-width:100%; }
+  .page canvas { display:block; max-width:100%; height:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Editor de PDF</h1>
+  <label class="btn primary">Abrir PDF<input id="file" type="file" accept="application/pdf" hidden></label>
+  <button id="zoomOut" title="Alejar">−</button>
+  <span id="zoomLabel">100%</span>
+  <button id="zoomIn" title="Acercar">+</button>
+  <span id="info"></span>
+</header>
+<div id="drop">Arrastra un PDF aquí o pulsa <b>Abrir PDF</b></div>
+<div id="pages"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+const state = { pdf: null, bytes: null, scale: 1.0 };
+const $ = id => document.getElementById(id);
+
+async function openFile(file) {
+  if (!file || file.type !== 'application/pdf') { alert('Elige un archivo PDF.'); return; }
+  state.bytes = new Uint8Array(await file.arrayBuffer());
+  // PDF.js consume el buffer, por eso le pasamos una copia y guardamos el original para pdf-lib.
+  state.pdf = await pdfjsLib.getDocument({ data: state.bytes.slice() }).promise;
+  $('info').textContent = `${file.name} · ${state.pdf.numPages} página(s)`;
+  $('drop').hidden = true;
+  render();
+}
+
+async function render() {
+  const container = $('pages');
+  container.innerHTML = '';
+  $('zoomLabel').textContent = Math.round(state.scale * 100) + '%';
+  const ratio = window.devicePixelRatio || 1;
+  for (let n = 1; n <= state.pdf.numPages; n++) {
+    const page = await state.pdf.getPage(n);
+    const viewport = page.getViewport({ scale: state.scale });
+    const wrap = document.createElement('div');
+    wrap.className = 'page';
+    wrap.dataset.page = n;
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width * ratio;
+    canvas.height = viewport.height * ratio;
+    canvas.style.width = viewport.width + 'px';
+    wrap.appendChild(canvas);
+    container.appendChild(wrap);
+    await page.render({
+      canvasContext: canvas.getContext('2d'),
+      viewport,
+      transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : null,
+    }).promise;
+  }
+}
+
+function zoom(delta) {
+  if (!state.pdf) return;
+  state.scale = Math.min(3, Math.max(0.5, +(state.scale + delta).toFixed(2)));
+  render();
+}
+
+$('file').addEventListener('change', e => openFile(e.target.files[0]));
+$('zoomIn').addEventListener('click', () => zoom(0.25));
+$('zoomOut').addEventListener('click', () => zoom(-0.25));
+const drop = $('drop');
+['dragover', 'dragenter'].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.remove('over'); }));
+document.addEventListener('drop', e => openFile(e.dataTransfer.files[0]));
+</script>
+</body>
+</html>
