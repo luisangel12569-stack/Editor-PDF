@@ -51,6 +51,14 @@
   .actions { position:absolute; display:flex; gap:4px; z-index:5; }
   .actions button { padding:4px 10px; font-size:14px; box-shadow:0 1px 3px rgba(0,0,0,.25); }
   .actions .del { background:var(--danger); border-color:var(--danger); color:#fff; }
+  #pagetools { flex-basis:100%; display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-size:14px; }
+  #pagetools[hidden] { display:none; }
+  #pagetools input[type=text], #pgRanges { font:inherit; padding:6px 8px; border:1px solid var(--border); border-radius:6px;
+           background:var(--panel); color:var(--text); max-width:100%; }
+  .page-box { display:flex; flex-direction:column; gap:4px; flex:none; }
+  .page-bar { display:flex; gap:6px; align-items:center; font-size:13px; color:var(--muted); }
+  .page-bar button { padding:0 8px; font-size:13px; }
+  .page-box.marked .page { outline:3px solid var(--accent); }
   label.check { display:inline-flex; align-items:center; gap:4px; font-size:14px; cursor:pointer; }
 </style>
 </head>
@@ -71,6 +79,15 @@
   </label>
   <button id="download" class="primary" disabled>Descargar PDF</button>
   <span id="info"></span>
+  <div id="pagetools" hidden>
+    <b>Páginas:</b>
+    <button id="pgAll">Marcar todas</button>
+    <button id="pgDelete" class="needsel" title="Quita del documento las páginas marcadas">Eliminar</button>
+    <button id="pgExtract" class="needsel" title="Descarga un PDF nuevo solo con las páginas marcadas">Extraer</button>
+    <label class="btn" title="Agrega las páginas de otro PDF después de la última página marcada, o al final">Añadir PDF<input id="pgAdd" type="file" accept="application/pdf" hidden></label>
+    <button id="pgSplit" title="Descarga un ZIP con varios PDFs">Separar</button>
+    <input id="pgRanges" placeholder="Rangos, ej: 1-3, 4-6 (vacío = cada página)" size="30">
+  </div>
 </header>
 <div id="hint" hidden></div>
 <div id="drop">Arrastra un PDF aquí o pulsa <b>Abrir PDF</b></div>
@@ -78,6 +95,7 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script>
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -85,7 +103,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc =
 // edits: clave "página:índice" -> texto original (en unidades PDF) + texto nuevo.
 // ops: áreas borradas o movidas, en unidades PDF: {page, x, y, w, h, bg, dx, dy, png}. png solo si se movió.
 const state = { pdf: null, bytes: null, name: 'documento.pdf', scale: 1.0, mode: 'text',
-                edits: new Map(), ops: [], history: [] };
+                edits: new Map(), ops: [], history: [], selected: new Set() };
 const $ = id => document.getElementById(id);
 const HINTS = {
   text: 'Haz clic en cualquier texto para cambiarlo. Pulsa Enter para confirmar o Esc para cancelar.',
@@ -101,9 +119,11 @@ async function openFile(file) {
   state.history = [];
   // PDF.js consume el buffer, por eso le pasamos una copia y guardamos el original para pdf-lib.
   state.pdf = await pdfjsLib.getDocument({ data: state.bytes.slice() }).promise;
-  $('info').textContent = `${file.name} · ${state.pdf.numPages} página(s)`;
+  state.selected.clear();
+  showInfo();
   $('drop').hidden = true;
   $('hint').hidden = false;
+  $('pagetools').hidden = false;
   setMode(state.mode);
   updateButtons();
   render();
@@ -120,7 +140,11 @@ function setMode(mode) {
 
 // Guarda una copia del estado antes de cada cambio para poder deshacerlo.
 function remember() {
-  state.history.push({ edits: new Map(state.edits), ops: state.ops.map(o => ({ ...o })) });
+  state.history.push({ bytes: state.bytes, edits: new Map(state.edits), ops: state.ops.map(o => ({ ...o })) });
+}
+
+function showInfo() {
+  $('info').textContent = `${state.name} · ${state.pdf.numPages} página(s)`;
 }
 
 async function render() {
@@ -144,7 +168,7 @@ async function render() {
     const layer = document.createElement('div');
     layer.className = 'layer';
     wrap.append(canvas, layer);
-    container.appendChild(wrap);
+    container.appendChild(pageBox(n, wrap));
     await paintPage(page, n, canvas, ratio);
     await buildTextLayer(page, n, viewport, canvas, layer, ratio);
     await buildImageBoxes(page, n, viewport, layer);
@@ -457,9 +481,15 @@ function startEditing(span, key, original) {
   span.addEventListener('blur', onBlur);
 }
 
-function undo() {
+async function undo() {
   const last = state.history.pop();
   if (!last) return;
+  if (last.bytes !== state.bytes) {
+    state.bytes = last.bytes;
+    state.pdf = await pdfjsLib.getDocument({ data: state.bytes.slice() }).promise;
+    state.selected.clear();
+    showInfo();
+  }
   state.edits = last.edits;
   state.ops = last.ops;
   updateButtons();
@@ -469,10 +499,168 @@ function undo() {
 function updateButtons() {
   $('undo').disabled = state.history.length === 0;
   $('download').disabled = !state.pdf;
+  if (state.pdf) $('pgAll').textContent = state.selected.size === state.pdf.numPages ? 'Desmarcar todas' : 'Marcar todas';
+  document.querySelectorAll('.needsel').forEach(b => { b.disabled = state.selected.size === 0; });
+}
+
+// Encima de cada página: casilla para marcarla y flechas para cambiarla de lugar.
+function pageBox(n, wrap) {
+  const box = document.createElement('div');
+  box.className = 'page-box' + (state.selected.has(n) ? ' marked' : '');
+  const bar = document.createElement('div');
+  bar.className = 'page-bar';
+  const check = document.createElement('label');
+  check.className = 'check';
+  check.innerHTML = `<input type="checkbox" ${state.selected.has(n) ? 'checked' : ''}> Página ${n}`;
+  check.querySelector('input').addEventListener('change', e => {
+    e.target.checked ? state.selected.add(n) : state.selected.delete(n);
+    box.classList.toggle('marked', e.target.checked);
+    updateButtons();
+  });
+  const arrow = (label, title, to) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.title = title;
+    b.disabled = to < 1 || to > state.pdf.numPages;
+    b.addEventListener('click', () => movePage(n, to).catch(showError));
+    bar.appendChild(b);
+  };
+  bar.appendChild(check);
+  arrow('↑', 'Subir esta página', n - 1);
+  arrow('↓', 'Bajar esta página', n + 1);
+  box.append(bar, wrap);
+  return box;
+}
+
+const showError = err => alert('Algo salió mal: ' + err.message);
+
+// Arma un PDF nuevo con las páginas indicadas (índices desde 0), en ese orden.
+async function pagesToDoc(parts) {
+  const out = await PDFLib.PDFDocument.create();
+  for (const [doc, indices] of parts) {
+    for (const p of await out.copyPages(doc, indices)) out.addPage(p);
+  }
+  return out;
+}
+
+const range = (from, to) => Array.from({ length: Math.max(0, to - from) }, (_, i) => from + i);
+
+// Las operaciones de páginas trabajan sobre el PDF con los cambios ya aplicados,
+// y luego ese resultado pasa a ser el documento abierto (se puede deshacer).
+async function editedDoc() {
+  return PDFLib.PDFDocument.load(await buildEditedBytes());
+}
+
+async function replaceDocument(bytes) {
+  remember();
+  state.bytes = bytes;
+  state.edits = new Map();
+  state.ops = [];
+  state.selected.clear();
+  state.pdf = await pdfjsLib.getDocument({ data: state.bytes.slice() }).promise;
+  showInfo();
+  updateButtons();
+  render();
+}
+
+function selectedIndices() {
+  return [...state.selected].sort((a, b) => a - b).map(n => n - 1);
+}
+
+async function deletePages() {
+  const total = state.pdf.numPages;
+  if (state.selected.size >= total) { alert('No puedes eliminar todas las páginas.'); return; }
+  const doc = await editedDoc();
+  const keep = range(0, total).filter(i => !state.selected.has(i + 1));
+  await replaceDocument(await (await pagesToDoc([[doc, keep]])).save());
+}
+
+async function extractPages() {
+  const doc = await editedDoc();
+  const pages = [...state.selected].sort((a, b) => a - b);
+  const bytes = await (await pagesToDoc([[doc, pages.map(n => n - 1)]])).save();
+  await saveFile(baseName() + '-paginas-' + compactRanges(pages) + '.pdf', bytes, 'application/pdf');
+}
+
+async function addPdf(file) {
+  if (!file || file.type !== 'application/pdf') { alert('Elige un archivo PDF.'); return; }
+  const other = await PDFLib.PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true });
+  const doc = await editedDoc();
+  const total = doc.getPageCount();
+  const after = state.selected.size ? Math.max(...state.selected) : total; // inserta después de esta página
+  const out = await pagesToDoc([
+    [doc, range(0, after)],
+    [other, range(0, other.getPageCount())],
+    [doc, range(after, total)],
+  ]);
+  await replaceDocument(await out.save());
+}
+
+async function movePage(from, to) {
+  const doc = await editedDoc();
+  const order = range(0, doc.getPageCount());
+  [order[from - 1], order[to - 1]] = [order[to - 1], order[from - 1]];
+  await replaceDocument(await (await pagesToDoc([[doc, order]])).save());
+}
+
+// "1-3, 5, 7-8" -> [[1,2,3],[5],[7,8]]. Vacío = una parte por página.
+function parseRanges(text, total) {
+  if (!text.trim()) return range(1, total + 1).map(n => [n]);
+  return text.split(/[,;]+/).map(s => s.trim()).filter(Boolean).map(s => {
+    const m = s.match(/^(\d+)\s*(?:-\s*(\d+))?$/);
+    if (!m) throw new Error(`No entiendo "${s}". Usa algo como 1-3, 4-6`);
+    const a = +m[1], b = +(m[2] || m[1]);
+    if (a < 1 || b > total || a > b) throw new Error(`"${s}" no es válido: el PDF tiene ${total} página(s).`);
+    return range(a, b + 1);
+  });
+}
+
+function compactRanges(pages) {
+  const out = [];
+  for (const n of pages) {
+    const last = out[out.length - 1];
+    if (last && n === last[1] + 1) last[1] = n; else out.push([n, n]);
+  }
+  return out.map(([a, b]) => a === b ? a : `${a}-${b}`).join('_');
+}
+
+async function splitPdf() {
+  const doc = await editedDoc();
+  const parts = parseRanges($('pgRanges').value, doc.getPageCount());
+  const zip = new JSZip();
+  for (const pages of parts) {
+    const bytes = await (await pagesToDoc([[doc, pages.map(n => n - 1)]])).save();
+    zip.file(`${baseName()}-paginas-${compactRanges(pages)}.pdf`, bytes);
+  }
+  await saveFile(baseName() + '-separado.zip', await zip.generateAsync({ type: 'uint8array' }), 'application/zip');
+}
+
+const baseName = () => state.name.replace(/\.pdf$/i, '');
+
+// Dentro de la vista previa de Claude la descarga pasa por su diálogo; en cualquier otra web, descarga normal.
+async function saveFile(filename, bytes, type) {
+  const claudeDownloads = window.claude?.use ? await window.claude.use('downloads') : null;
+  if (claudeDownloads) {
+    try { await claudeDownloads.save({ filename, data: bytes }); }
+    catch (err) { if (err.code !== 'declined') throw err; }
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([bytes], { type }));
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+async function download() {
+  let bytes = await buildEditedBytes();
+  if ($('secure').checked) bytes = await flattenChangedPages(bytes);
+  await saveFile(baseName() + '-editado.pdf', bytes, 'application/pdf');
 }
 
 // Escribe los cambios en el PDF: tapa lo viejo con el color de fondo y dibuja lo nuevo encima.
-async function download() {
+async function buildEditedBytes() {
+  if (!state.edits.size && !state.ops.length) return state.bytes;
   const { PDFDocument, StandardFonts, rgb } = PDFLib;
   const doc = await PDFDocument.load(state.bytes);
   const fonts = {};
@@ -495,21 +683,7 @@ async function download() {
     page.drawRectangle({ x: e.x - 1, y: e.y - e.size * 0.25, width: e.width + 2, height: e.size * 1.2, color: color(e.bg) });
     if (e.text) page.drawText(e.text, { x: e.x, y: e.y, size: e.size, font, color: color(e.fg) });
   }
-  let bytes = await doc.save();
-  if ($('secure').checked) bytes = await flattenChangedPages(bytes);
-  const filename = state.name.replace(/\.pdf$/i, '') + '-editado.pdf';
-  // Dentro de la vista previa de Claude la descarga pasa por su diálogo; en cualquier otra web, descarga normal.
-  const claudeDownloads = window.claude?.use ? await window.claude.use('downloads') : null;
-  if (claudeDownloads) {
-    try { await claudeDownloads.save({ filename, data: bytes }); }
-    catch (err) { if (err.code !== 'declined') throw err; }
-    return;
-  }
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
-  a.download = filename;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  return doc.save();
 }
 
 // Borrado seguro: las páginas con cambios se vuelven una imagen, así lo tapado desaparece del archivo.
@@ -549,7 +723,17 @@ $('modeText').addEventListener('click', () => setMode('text'));
 $('modeArea').addEventListener('click', () => setMode('area'));
 $('zoomIn').addEventListener('click', () => zoom(0.25));
 $('zoomOut').addEventListener('click', () => zoom(-0.25));
-$('undo').addEventListener('click', undo);
+$('undo').addEventListener('click', () => undo().catch(showError));
+$('pgAll').addEventListener('click', () => {
+  const all = state.selected.size < state.pdf.numPages;
+  state.selected = new Set(all ? range(1, state.pdf.numPages + 1) : []);
+  updateButtons();
+  render();
+});
+$('pgDelete').addEventListener('click', () => deletePages().catch(showError));
+$('pgExtract').addEventListener('click', () => extractPages().catch(showError));
+$('pgAdd').addEventListener('change', e => { addPdf(e.target.files[0]).catch(showError); e.target.value = ''; });
+$('pgSplit').addEventListener('click', () => splitPdf().catch(showError));
 $('download').addEventListener('click', () => download().catch(err => alert('No se pudo guardar: ' + err.message)));
 const drop = $('drop');
 ['dragover', 'dragenter'].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
