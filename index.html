@@ -17,14 +17,23 @@
   header h1 { font-size:18px; margin:0 12px 0 0; }
   button, label.btn { font:inherit; padding:6px 12px; border:1px solid var(--border); border-radius:6px;
            background:var(--panel); color:var(--text); cursor:pointer; }
-  label.btn.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  label.btn.primary, button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
   #info { color:var(--muted); font-size:14px; margin-left:auto; }
+  #hint { padding:8px 16px; font-size:14px; color:var(--muted); text-align:center; }
   #drop { margin:32px 16px; padding:48px 16px; border:2px dashed var(--border); border-radius:12px;
           text-align:center; color:var(--muted); }
   #drop.over { border-color:var(--accent); color:var(--accent); }
-  #pages { display:flex; flex-direction:column; align-items:center; gap:16px; padding:16px; }
-  .page { position:relative; background:#fff; box-shadow:0 1px 4px rgba(0,0,0,.25); max-width:100%; }
-  .page canvas { display:block; max-width:100%; height:auto; }
+  #pages { display:flex; flex-direction:column; align-items:center; gap:16px; padding:16px; overflow-x:auto; }
+  .page { position:relative; background:#fff; box-shadow:0 1px 4px rgba(0,0,0,.25); flex:none; }
+  .page canvas { display:block; }
+  .layer { position:absolute; inset:0; }
+  /* Cada texto del PDF tiene una caja transparente encima para poder hacer clic y editarlo. */
+  .txt { position:absolute; white-space:pre; color:transparent; cursor:text; line-height:1;
+         border-radius:2px; outline:none; transform-origin:0 0; }
+  .txt:hover { background:rgba(37,99,235,.12); outline:1px solid rgba(37,99,235,.5); }
+  .txt.editing, .txt.edited { outline:1px solid var(--accent); }
+  .txt.editing { min-width:4px; }
 </style>
 </head>
 <body>
@@ -34,26 +43,36 @@
   <button id="zoomOut" title="Alejar">−</button>
   <span id="zoomLabel">100%</span>
   <button id="zoomIn" title="Acercar">+</button>
+  <button id="undo" disabled title="Deshacer el último cambio">Deshacer</button>
+  <button id="download" class="primary" disabled>Descargar PDF</button>
   <span id="info"></span>
 </header>
+<div id="hint" hidden>Haz clic en cualquier texto para cambiarlo. Pulsa Enter para confirmar o Esc para cancelar.</div>
 <div id="drop">Arrastra un PDF aquí o pulsa <b>Abrir PDF</b></div>
 <div id="pages"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
 <script>
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-const state = { pdf: null, bytes: null, scale: 1.0 };
+// edits: clave "página:índice" -> datos del texto original (en unidades PDF) + texto nuevo
+const state = { pdf: null, bytes: null, name: 'documento.pdf', scale: 1.0, edits: new Map(), history: [] };
 const $ = id => document.getElementById(id);
 
 async function openFile(file) {
   if (!file || file.type !== 'application/pdf') { alert('Elige un archivo PDF.'); return; }
   state.bytes = new Uint8Array(await file.arrayBuffer());
+  state.name = file.name;
+  state.edits.clear();
+  state.history = [];
   // PDF.js consume el buffer, por eso le pasamos una copia y guardamos el original para pdf-lib.
   state.pdf = await pdfjsLib.getDocument({ data: state.bytes.slice() }).promise;
   $('info').textContent = `${file.name} · ${state.pdf.numPages} página(s)`;
   $('drop').hidden = true;
+  $('hint').hidden = false;
+  updateButtons();
   render();
 }
 
@@ -68,18 +87,175 @@ async function render() {
     const wrap = document.createElement('div');
     wrap.className = 'page';
     wrap.dataset.page = n;
+    wrap.style.width = viewport.width + 'px';
+    wrap.style.height = viewport.height + 'px';
     const canvas = document.createElement('canvas');
     canvas.width = viewport.width * ratio;
     canvas.height = viewport.height * ratio;
     canvas.style.width = viewport.width + 'px';
-    wrap.appendChild(canvas);
+    canvas.style.height = viewport.height + 'px';
+    const layer = document.createElement('div');
+    layer.className = 'layer';
+    wrap.append(canvas, layer);
     container.appendChild(wrap);
     await page.render({
       canvasContext: canvas.getContext('2d'),
       viewport,
       transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : null,
     }).promise;
+    await buildTextLayer(page, n, viewport, canvas, layer, ratio);
   }
+}
+
+async function buildTextLayer(page, n, viewport, canvas, layer, ratio) {
+  const content = await page.getTextContent();
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  content.items.forEach((item, i) => {
+    if (!item.str || !item.str.trim()) return;
+    const key = n + ':' + i;
+    const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+    const h = Math.hypot(tx[2], tx[3]);
+    const box = { left: tx[4], top: tx[5] - h, width: item.width * state.scale, height: h };
+    const style = content.styles[item.fontName] || {};
+    const span = document.createElement('span');
+    span.className = 'txt';
+    span.textContent = item.str;
+    span.style.left = box.left + 'px';
+    span.style.top = box.top + 'px';
+    span.style.height = (h * 1.15) + 'px';
+    span.style.fontSize = h + 'px';
+    span.style.fontFamily = style.fontFamily || 'sans-serif';
+    layer.appendChild(span);
+    // Ajusta el ancho de la caja al del texto real del PDF.
+    const natural = span.getBoundingClientRect().width;
+    if (natural > 0 && box.width > 0) span.style.transform = `scaleX(${box.width / natural})`;
+
+    const original = {
+      page: n, str: item.str,
+      x: item.transform[4], y: item.transform[5],
+      size: Math.hypot(item.transform[2], item.transform[3]),
+      width: item.width,
+      font: fontInfo(page, item.fontName, style),
+      ...sampleColors(ctx, box, ratio),
+    };
+    const edit = state.edits.get(key);
+    if (edit) showEdited(span, edit);
+    span.addEventListener('click', () => startEditing(span, key, original));
+  });
+}
+
+// Adivina la familia y si es negrita/cursiva a partir del nombre de la fuente incrustada.
+function fontInfo(page, fontName, style) {
+  let name = '';
+  try { if (page.commonObjs.has(fontName)) name = page.commonObjs.get(fontName).name || ''; } catch (e) {}
+  const family = /courier|mono/i.test(name) || style.fontFamily === 'monospace' ? 'Courier'
+               : /times|serif|roman|georgia|garamond/i.test(name.replace(/sans/i, '')) || style.fontFamily === 'serif' ? 'Times'
+               : 'Helvetica';
+  return { family, bold: /bold|black|heavy|semibold/i.test(name), italic: /italic|oblique/i.test(name) };
+}
+
+// Toma el color de fondo (para tapar el texto viejo) y el color del texto, mirando los píxeles de la página.
+function sampleColors(ctx, box, ratio) {
+  const px = (x, y) => Array.from(ctx.getImageData(Math.max(0, Math.round(x * ratio)), Math.max(0, Math.round(y * ratio)), 1, 1).data);
+  const lum = c => c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114;
+  const around = [
+    px(box.left - 2, box.top + box.height / 2), px(box.left + box.width + 2, box.top + box.height / 2),
+    px(box.left + box.width / 2, box.top - 2), px(box.left + box.width / 2, box.top + box.height + 2),
+  ];
+  const bg = around.reduce((a, b) => lum(b) > lum(a) ? b : a);
+  let fg = bg;
+  try {
+    const w = Math.max(1, Math.round(box.width * ratio)), h = Math.max(1, Math.round(box.height * ratio));
+    const d = ctx.getImageData(Math.round(box.left * ratio), Math.round(box.top * ratio), w, h).data;
+    for (let i = 0; i < d.length; i += 4) {
+      const c = [d[i], d[i + 1], d[i + 2]];
+      if (Math.abs(lum(c) - lum(bg)) > Math.abs(lum(fg) - lum(bg))) fg = c;
+    }
+  } catch (e) {}
+  return { bg: bg.slice(0, 3), fg: fg.slice(0, 3) };
+}
+
+const css = c => `rgb(${c[0]},${c[1]},${c[2]})`;
+
+function showEdited(span, edit) {
+  span.textContent = edit.text;
+  span.classList.add('edited');
+  span.style.color = css(edit.fg);
+  span.style.background = css(edit.bg);
+  span.style.transform = 'none';
+  span.style.fontFamily = { Courier: 'Courier New, monospace', Times: 'Times New Roman, serif', Helvetica: 'Helvetica, Arial, sans-serif' }[edit.font.family];
+  span.style.fontWeight = edit.font.bold ? 'bold' : 'normal';
+  span.style.fontStyle = edit.font.italic ? 'italic' : 'normal';
+}
+
+function startEditing(span, key, original) {
+  if (span.isContentEditable) return;
+  const before = state.edits.get(key);
+  showEdited(span, before || { ...original, text: original.str });
+  span.classList.add('editing');
+  span.contentEditable = 'plaintext-only';
+  span.focus();
+  document.getSelection().selectAllChildren(span);
+
+  const finish = (save) => {
+    span.removeEventListener('keydown', onKey);
+    span.removeEventListener('blur', onBlur);
+    span.contentEditable = 'false';
+    span.classList.remove('editing');
+    const text = span.textContent.replace(/\n/g, ' ');
+    const current = before ? before.text : original.str;
+    if (save && text !== current) {
+      state.history.push({ key, previous: before });
+      state.edits.set(key, { ...original, text });
+    }
+    updateButtons();
+    render();
+  };
+  const onKey = e => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  };
+  const onBlur = () => finish(true);
+  span.addEventListener('keydown', onKey);
+  span.addEventListener('blur', onBlur);
+}
+
+function undo() {
+  const last = state.history.pop();
+  if (!last) return;
+  if (last.previous) state.edits.set(last.key, last.previous); else state.edits.delete(last.key);
+  updateButtons();
+  render();
+}
+
+function updateButtons() {
+  $('undo').disabled = state.history.length === 0;
+  $('download').disabled = !state.pdf;
+}
+
+// Escribe los cambios en el PDF: tapa el texto viejo con el color de fondo y escribe el nuevo encima.
+async function download() {
+  const { PDFDocument, StandardFonts, rgb } = PDFLib;
+  const doc = await PDFDocument.load(state.bytes);
+  const fonts = {};
+  const getFont = async f => {
+    const key = f.family + (f.bold ? 'Bold' : '') + (f.italic ? (f.family === 'Times' ? 'Italic' : 'Oblique') : '');
+    const std = { Times: 'TimesRoman', TimesBold: 'TimesRomanBold', TimesItalic: 'TimesRomanItalic', TimesBoldItalic: 'TimesRomanBoldItalic' }[key] || key;
+    return fonts[std] ||= await doc.embedFont(StandardFonts[std]);
+  };
+  const color = c => rgb(c[0] / 255, c[1] / 255, c[2] / 255);
+  for (const e of state.edits.values()) {
+    const page = doc.getPage(e.page - 1);
+    const font = await getFont(e.font);
+    page.drawRectangle({ x: e.x - 1, y: e.y - e.size * 0.25, width: e.width + 2, height: e.size * 1.2, color: color(e.bg) });
+    if (e.text) page.drawText(e.text, { x: e.x, y: e.y, size: e.size, font, color: color(e.fg) });
+  }
+  const bytes = await doc.save();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+  a.download = state.name.replace(/\.pdf$/i, '') + '-editado.pdf';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
 function zoom(delta) {
@@ -91,6 +267,8 @@ function zoom(delta) {
 $('file').addEventListener('change', e => openFile(e.target.files[0]));
 $('zoomIn').addEventListener('click', () => zoom(0.25));
 $('zoomOut').addEventListener('click', () => zoom(-0.25));
+$('undo').addEventListener('click', undo);
+$('download').addEventListener('click', () => download().catch(err => alert('No se pudo guardar: ' + err.message)));
 const drop = $('drop');
 ['dragover', 'dragenter'].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
 ['dragleave', 'drop'].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.remove('over'); }));
