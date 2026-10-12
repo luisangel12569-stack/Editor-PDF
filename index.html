@@ -251,9 +251,17 @@ async function download() {
     if (e.text) page.drawText(e.text, { x: e.x, y: e.y, size: e.size, font, color: color(e.fg) });
   }
   const bytes = await doc.save();
+  const filename = state.name.replace(/\.pdf$/i, '') + '-editado.pdf';
+  // Dentro de la vista previa de Claude la descarga pasa por su diálogo; en cualquier otra web, descarga normal.
+  const claudeDownloads = window.claude?.use ? await window.claude.use('downloads') : null;
+  if (claudeDownloads) {
+    try { await claudeDownloads.save({ filename, data: bytes }); }
+    catch (err) { if (err.code !== 'declined') throw err; }
+    return;
+  }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
-  a.download = state.name.replace(/\.pdf$/i, '') + '-editado.pdf';
+  a.download = filename;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
