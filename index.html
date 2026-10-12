@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Editor de PDF</title>
 <style>
-  :root { --bg:#f3f4f6; --panel:#ffffff; --text:#111827; --muted:#6b7280; --accent:#2563eb; --border:#e5e7eb; }
+  :root { --bg:#f3f4f6; --panel:#ffffff; --text:#111827; --muted:#6b7280; --accent:#2563eb; --border:#e5e7eb; --danger:#dc2626; }
   @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) { --bg:#111827; --panel:#1f2937; --text:#f9fafb; --muted:#9ca3af; --accent:#60a5fa; --border:#374151; }
+    :root:not([data-theme="light"]) { --bg:#111827; --panel:#1f2937; --text:#f9fafb; --muted:#9ca3af; --accent:#60a5fa; --border:#374151; --danger:#f87171; }
   }
-  :root[data-theme="dark"] { --bg:#111827; --panel:#1f2937; --text:#f9fafb; --muted:#9ca3af; --accent:#60a5fa; --border:#374151; }
+  :root[data-theme="dark"] { --bg:#111827; --panel:#1f2937; --text:#f9fafb; --muted:#9ca3af; --accent:#60a5fa; --border:#374151; --danger:#f87171; }
   * { box-sizing: border-box; }
   body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
   header { position:sticky; top:0; z-index:10; display:flex; flex-wrap:wrap; gap:8px; align-items:center;
@@ -19,6 +19,11 @@
            background:var(--panel); color:var(--text); cursor:pointer; }
   button:disabled { opacity:.5; cursor:default; }
   label.btn.primary, button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .group { display:inline-flex; }
+  .group button { border-radius:0; }
+  .group button:first-child { border-radius:6px 0 0 6px; }
+  .group button:last-child { border-radius:0 6px 6px 0; border-left:none; }
+  .group button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
   #info { color:var(--muted); font-size:14px; margin-left:auto; }
   #hint { padding:8px 16px; font-size:14px; color:var(--muted); text-align:center; }
   #drop { margin:32px 16px; padding:48px 16px; border:2px dashed var(--border); border-radius:12px;
@@ -34,12 +39,28 @@
   .txt:hover { background:rgba(37,99,235,.12); outline:1px solid rgba(37,99,235,.5); }
   .txt.editing, .txt.edited { outline:1px solid var(--accent); }
   .txt.editing { min-width:4px; }
+  /* Modo "Seleccionar": los textos no reciben clics, se dibuja un área. */
+  body.area .txt { pointer-events:none; }
+  body.area .layer { cursor:crosshair; touch-action:none; }
+  .img-box { position:absolute; border:1px dashed rgba(37,99,235,.7); display:none; cursor:pointer; }
+  body.area .img-box { display:block; }
+  .img-box:hover { background:rgba(37,99,235,.12); }
+  .sel { position:absolute; border:2px solid var(--accent); background:rgba(37,99,235,.15); pointer-events:none; }
+  .moved { position:absolute; cursor:move; outline:1px dashed var(--accent); touch-action:none; }
+  body:not(.area) .moved { pointer-events:none; outline:none; }
+  .actions { position:absolute; display:flex; gap:4px; z-index:5; }
+  .actions button { padding:4px 10px; font-size:14px; box-shadow:0 1px 3px rgba(0,0,0,.25); }
+  .actions .del { background:var(--danger); border-color:var(--danger); color:#fff; }
 </style>
 </head>
 <body>
 <header>
   <h1>Editor de PDF</h1>
   <label class="btn primary">Abrir PDF<input id="file" type="file" accept="application/pdf" hidden></label>
+  <span class="group">
+    <button id="modeText" class="on" title="Haz clic en un texto para cambiarlo">Texto</button>
+    <button id="modeArea" title="Selecciona cuadros, imágenes o firmas para borrarlos o moverlos">Seleccionar</button>
+  </span>
   <button id="zoomOut" title="Alejar">−</button>
   <span id="zoomLabel">100%</span>
   <button id="zoomIn" title="Acercar">+</button>
@@ -47,7 +68,7 @@
   <button id="download" class="primary" disabled>Descargar PDF</button>
   <span id="info"></span>
 </header>
-<div id="hint" hidden>Haz clic en cualquier texto para cambiarlo. Pulsa Enter para confirmar o Esc para cancelar.</div>
+<div id="hint" hidden></div>
 <div id="drop">Arrastra un PDF aquí o pulsa <b>Abrir PDF</b></div>
 <div id="pages"></div>
 
@@ -57,23 +78,45 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-// edits: clave "página:índice" -> datos del texto original (en unidades PDF) + texto nuevo
-const state = { pdf: null, bytes: null, name: 'documento.pdf', scale: 1.0, edits: new Map(), history: [] };
+// edits: clave "página:índice" -> texto original (en unidades PDF) + texto nuevo.
+// ops: áreas borradas o movidas, en unidades PDF: {page, x, y, w, h, bg, dx, dy, png}. png solo si se movió.
+const state = { pdf: null, bytes: null, name: 'documento.pdf', scale: 1.0, mode: 'text',
+                edits: new Map(), ops: [], history: [] };
 const $ = id => document.getElementById(id);
+const HINTS = {
+  text: 'Haz clic en cualquier texto para cambiarlo. Pulsa Enter para confirmar o Esc para cancelar.',
+  area: 'Arrastra para marcar un área (cuadro, firma, sello) o haz clic en una imagen marcada con línea punteada. Lo movido se puede arrastrar.',
+};
 
 async function openFile(file) {
   if (!file || file.type !== 'application/pdf') { alert('Elige un archivo PDF.'); return; }
   state.bytes = new Uint8Array(await file.arrayBuffer());
   state.name = file.name;
   state.edits.clear();
+  state.ops = [];
   state.history = [];
   // PDF.js consume el buffer, por eso le pasamos una copia y guardamos el original para pdf-lib.
   state.pdf = await pdfjsLib.getDocument({ data: state.bytes.slice() }).promise;
   $('info').textContent = `${file.name} · ${state.pdf.numPages} página(s)`;
   $('drop').hidden = true;
   $('hint').hidden = false;
+  setMode(state.mode);
   updateButtons();
   render();
+}
+
+function setMode(mode) {
+  state.mode = mode;
+  document.body.classList.toggle('area', mode === 'area');
+  $('modeText').classList.toggle('on', mode === 'text');
+  $('modeArea').classList.toggle('on', mode === 'area');
+  $('hint').textContent = HINTS[mode];
+  document.querySelectorAll('.sel, .actions').forEach(el => el.remove());
+}
+
+// Guarda una copia del estado antes de cada cambio para poder deshacerlo.
+function remember() {
+  state.history.push({ edits: new Map(state.edits), ops: state.ops.map(o => ({ ...o })) });
 }
 
 async function render() {
@@ -98,13 +141,51 @@ async function render() {
     layer.className = 'layer';
     wrap.append(canvas, layer);
     container.appendChild(wrap);
-    await page.render({
-      canvasContext: canvas.getContext('2d'),
-      viewport,
-      transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : null,
-    }).promise;
+    await paintPage(page, n, canvas, ratio);
     await buildTextLayer(page, n, viewport, canvas, layer, ratio);
+    await buildImageBoxes(page, n, viewport, layer);
+    buildMovedPieces(n, viewport, layer);
+    enableAreaSelection(n, viewport, canvas, layer, ratio);
   }
+}
+
+// Dibuja la página y encima los borrados/movimientos. Sirve para la vista y para recortar en alta resolución.
+async function paintPage(page, n, canvas, ratio, scale = state.scale) {
+  const viewport = page.getViewport({ scale });
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  await page.render({ canvasContext: ctx, viewport, transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : null }).promise;
+  const ops = state.ops.filter(o => o.page === n);
+  ctx.save();
+  ctx.scale(ratio, ratio);
+  for (const o of ops) {
+    const r = toView(viewport, o.x, o.y, o.w, o.h);
+    ctx.fillStyle = css(o.bg);
+    ctx.fillRect(r.left, r.top, r.width, r.height);
+  }
+  for (const o of ops.filter(o => o.png)) {
+    const r = toView(viewport, o.x + o.dx, o.y + o.dy, o.w, o.h);
+    ctx.drawImage(await loadImage(o.png), r.left, r.top, r.width, r.height);
+  }
+  ctx.restore();
+}
+
+const imageCache = new Map();
+function loadImage(src) {
+  if (!imageCache.has(src)) imageCache.set(src, new Promise((ok, fail) => {
+    const img = new Image(); img.onload = () => ok(img); img.onerror = fail; img.src = src;
+  }));
+  return imageCache.get(src);
+}
+
+// Convierte un rectángulo en unidades PDF (x, y = esquina inferior izquierda) a píxeles de pantalla y viceversa.
+function toView(viewport, x, y, w, h) {
+  const [x1, y1, x2, y2] = viewport.convertToViewportRectangle([x, y, x + w, y + h]);
+  return { left: Math.min(x1, x2), top: Math.min(y1, y2), width: Math.abs(x2 - x1), height: Math.abs(y2 - y1) };
+}
+function toPdf(viewport, r) {
+  const [x1, y1] = viewport.convertToPdfPoint(r.left, r.top);
+  const [x2, y2] = viewport.convertToPdfPoint(r.left + r.width, r.top + r.height);
+  return { x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.abs(x2 - x1), h: Math.abs(y2 - y1) };
 }
 
 async function buildTextLayer(page, n, viewport, canvas, layer, ratio) {
@@ -144,6 +225,147 @@ async function buildTextLayer(page, n, viewport, canvas, layer, ratio) {
   });
 }
 
+// Busca las imágenes de la página (fotos, firmas escaneadas, logos) siguiendo las transformaciones del PDF.
+async function buildImageBoxes(page, n, viewport, layer) {
+  const { OPS, Util } = pdfjsLib;
+  const list = await page.getOperatorList();
+  const [, , pw, ph] = page.view;
+  let ctm = [1, 0, 0, 1, 0, 0];
+  const stack = [];
+  list.fnArray.forEach((fn, i) => {
+    if (fn === OPS.save) stack.push(ctm);
+    else if (fn === OPS.restore) ctm = stack.pop() || [1, 0, 0, 1, 0, 0];
+    else if (fn === OPS.transform) ctm = Util.transform(ctm, list.argsArray[i]);
+    else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject || fn === OPS.paintImageMaskXObject) {
+      const pts = [[0, 0], [1, 0], [0, 1], [1, 1]].map(p => Util.applyTransform(p, ctm));
+      const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+      const x = Math.min(...xs), y = Math.min(...ys), w = Math.max(...xs) - x, h = Math.max(...ys) - y;
+      if (w * h > pw * ph * 0.9 || w < 2 || h < 2) return; // ignora fondos de página completa (escaneos)
+      const covered = state.ops.some(o => o.page === n && o.x <= x + 1 && o.y <= y + 1 && o.x + o.w >= x + w - 1 && o.y + o.h >= y + h - 1);
+      if (covered) return; // ya se borró o movió
+      const r = toView(viewport, x, y, w, h);
+      const box = document.createElement('div');
+      box.className = 'img-box';
+      Object.assign(box.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+      box.title = 'Imagen: clic para seleccionarla';
+      box.addEventListener('pointerdown', e => e.stopPropagation());
+      box.addEventListener('click', e => { e.stopPropagation(); select(n, viewport, layer, r); });
+      layer.appendChild(box);
+    }
+  });
+}
+
+// Lo que se movió aparece como una pieza que se puede seguir arrastrando.
+function buildMovedPieces(n, viewport, layer) {
+  state.ops.forEach((o, idx) => {
+    if (o.page !== n || !o.png) return;
+    const r = toView(viewport, o.x + o.dx, o.y + o.dy, o.w, o.h);
+    const piece = document.createElement('div');
+    piece.className = 'moved';
+    piece.title = 'Arrastra para mover';
+    Object.assign(piece.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+    piece.addEventListener('pointerdown', e => {
+      e.stopPropagation();
+      piece.setPointerCapture(e.pointerId);
+      const start = { x: e.clientX, y: e.clientY };
+      const move = ev => { piece.style.transform = `translate(${ev.clientX - start.x}px, ${ev.clientY - start.y}px)`; };
+      const up = ev => {
+        piece.removeEventListener('pointermove', move);
+        piece.removeEventListener('pointerup', up);
+        const dxPx = ev.clientX - start.x, dyPx = ev.clientY - start.y;
+        if (Math.abs(dxPx) + Math.abs(dyPx) < 2) { piece.style.transform = ''; return; }
+        remember();
+        o.dx += dxPx / state.scale;
+        o.dy -= dyPx / state.scale; // en PDF el eje Y crece hacia arriba
+        state.ops[idx] = { ...o };
+        updateButtons();
+        render();
+      };
+      piece.addEventListener('pointermove', move);
+      piece.addEventListener('pointerup', up);
+    });
+    layer.appendChild(piece);
+  });
+}
+
+function enableAreaSelection(n, viewport, canvas, layer, ratio) {
+  layer.addEventListener('pointerdown', e => {
+    if (state.mode !== 'area' || e.target !== layer) return;
+    document.querySelectorAll('.sel, .actions').forEach(el => el.remove());
+    const origin = layer.getBoundingClientRect();
+    const sx = e.clientX - origin.left, sy = e.clientY - origin.top;
+    const sel = document.createElement('div');
+    sel.className = 'sel';
+    layer.appendChild(sel);
+    layer.setPointerCapture(e.pointerId);
+    let r = { left: sx, top: sy, width: 0, height: 0 };
+    const move = ev => {
+      const cx = Math.max(0, Math.min(viewport.width, ev.clientX - origin.left));
+      const cy = Math.max(0, Math.min(viewport.height, ev.clientY - origin.top));
+      r = { left: Math.min(sx, cx), top: Math.min(sy, cy), width: Math.abs(cx - sx), height: Math.abs(cy - sy) };
+      Object.assign(sel.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+    };
+    const up = () => {
+      layer.removeEventListener('pointermove', move);
+      layer.removeEventListener('pointerup', up);
+      sel.remove();
+      if (r.width > 4 && r.height > 4) select(n, viewport, layer, r);
+    };
+    layer.addEventListener('pointermove', move);
+    layer.addEventListener('pointerup', up);
+  });
+}
+
+// Muestra el área elegida con los botones Borrar / Mover.
+function select(n, viewport, layer, r) {
+  document.querySelectorAll('.sel, .actions').forEach(el => el.remove());
+  const sel = document.createElement('div');
+  sel.className = 'sel';
+  Object.assign(sel.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+  const bar = document.createElement('div');
+  bar.className = 'actions';
+  bar.style.left = r.left + 'px';
+  bar.style.top = Math.max(0, r.top - 36) + 'px';
+  const btn = (label, cls, fn) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    if (cls) b.className = cls;
+    b.addEventListener('pointerdown', e => e.stopPropagation());
+    b.addEventListener('click', e => { e.stopPropagation(); fn(); });
+    bar.appendChild(b);
+  };
+  btn('Borrar', 'del', () => applyArea(n, viewport, layer, r, false));
+  btn('Mover', 'primary', () => applyArea(n, viewport, layer, r, true));
+  btn('Cancelar', '', () => { sel.remove(); bar.remove(); });
+  layer.append(sel, bar);
+}
+
+async function applyArea(n, viewport, layer, r, keepCopy) {
+  const canvas = layer.parentElement.querySelector('canvas');
+  const ratio = canvas.width / viewport.width;
+  const area = toPdf(viewport, r);
+  const op = { page: n, ...area, bg: sampleBackground(canvas.getContext('2d', { willReadFrequently: true }), r, ratio), dx: 0, dy: 0, png: null };
+  if (keepCopy) {
+    // Recorta la pieza en alta resolución para que no se vea borrosa en el PDF final.
+    const page = await state.pdf.getPage(n);
+    const hiScale = 3;
+    const hi = page.getViewport({ scale: hiScale });
+    const big = document.createElement('canvas');
+    big.width = hi.width; big.height = hi.height;
+    await paintPage(page, n, big, 1, hiScale);
+    const cr = toView(hi, area.x, area.y, area.w, area.h);
+    const piece = document.createElement('canvas');
+    piece.width = Math.max(1, Math.round(cr.width)); piece.height = Math.max(1, Math.round(cr.height));
+    piece.getContext('2d').drawImage(big, cr.left, cr.top, cr.width, cr.height, 0, 0, piece.width, piece.height);
+    op.png = piece.toDataURL('image/png');
+    op.dx = 10; op.dy = -10; // se desplaza un poco para que se note que ya se puede arrastrar
+  }
+  remember();
+  state.ops.push(op);
+  updateButtons();
+  render();
+}
+
 // Adivina la familia y si es negrita/cursiva a partir del nombre de la fuente incrustada.
 function fontInfo(page, fontName, style) {
   let name = '';
@@ -154,15 +376,26 @@ function fontInfo(page, fontName, style) {
   return { family, bold: /bold|black|heavy|semibold/i.test(name), italic: /italic|oblique/i.test(name) };
 }
 
+const lum = c => c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114;
+function pixel(ctx, x, y, ratio) {
+  const cx = Math.min(ctx.canvas.width - 1, Math.max(0, Math.round(x * ratio)));
+  const cy = Math.min(ctx.canvas.height - 1, Math.max(0, Math.round(y * ratio)));
+  return Array.from(ctx.getImageData(cx, cy, 1, 1).data).slice(0, 3);
+}
+
+// El color de fondo es el más claro justo alrededor del área (fuera de ella).
+function sampleBackground(ctx, box, ratio) {
+  const pts = [];
+  for (const f of [0.1, 0.5, 0.9]) {
+    pts.push([box.left - 3, box.top + box.height * f], [box.left + box.width + 3, box.top + box.height * f],
+             [box.left + box.width * f, box.top - 3], [box.left + box.width * f, box.top + box.height + 3]);
+  }
+  return pts.map(([x, y]) => pixel(ctx, x, y, ratio)).reduce((a, b) => lum(b) > lum(a) ? b : a);
+}
+
 // Toma el color de fondo (para tapar el texto viejo) y el color del texto, mirando los píxeles de la página.
 function sampleColors(ctx, box, ratio) {
-  const px = (x, y) => Array.from(ctx.getImageData(Math.max(0, Math.round(x * ratio)), Math.max(0, Math.round(y * ratio)), 1, 1).data);
-  const lum = c => c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114;
-  const around = [
-    px(box.left - 2, box.top + box.height / 2), px(box.left + box.width + 2, box.top + box.height / 2),
-    px(box.left + box.width / 2, box.top - 2), px(box.left + box.width / 2, box.top + box.height + 2),
-  ];
-  const bg = around.reduce((a, b) => lum(b) > lum(a) ? b : a);
+  const bg = sampleBackground(ctx, box, ratio);
   let fg = bg;
   try {
     const w = Math.max(1, Math.round(box.width * ratio)), h = Math.max(1, Math.round(box.height * ratio));
@@ -172,7 +405,7 @@ function sampleColors(ctx, box, ratio) {
       if (Math.abs(lum(c) - lum(bg)) > Math.abs(lum(fg) - lum(bg))) fg = c;
     }
   } catch (e) {}
-  return { bg: bg.slice(0, 3), fg: fg.slice(0, 3) };
+  return { bg, fg };
 }
 
 const css = c => `rgb(${c[0]},${c[1]},${c[2]})`;
@@ -205,7 +438,7 @@ function startEditing(span, key, original) {
     const text = span.textContent.replace(/\n/g, ' ');
     const current = before ? before.text : original.str;
     if (save && text !== current) {
-      state.history.push({ key, previous: before });
+      remember();
       state.edits.set(key, { ...original, text });
     }
     updateButtons();
@@ -223,7 +456,8 @@ function startEditing(span, key, original) {
 function undo() {
   const last = state.history.pop();
   if (!last) return;
-  if (last.previous) state.edits.set(last.key, last.previous); else state.edits.delete(last.key);
+  state.edits = last.edits;
+  state.ops = last.ops;
   updateButtons();
   render();
 }
@@ -233,7 +467,7 @@ function updateButtons() {
   $('download').disabled = !state.pdf;
 }
 
-// Escribe los cambios en el PDF: tapa el texto viejo con el color de fondo y escribe el nuevo encima.
+// Escribe los cambios en el PDF: tapa lo viejo con el color de fondo y dibuja lo nuevo encima.
 async function download() {
   const { PDFDocument, StandardFonts, rgb } = PDFLib;
   const doc = await PDFDocument.load(state.bytes);
@@ -244,6 +478,13 @@ async function download() {
     return fonts[std] ||= await doc.embedFont(StandardFonts[std]);
   };
   const color = c => rgb(c[0] / 255, c[1] / 255, c[2] / 255);
+  for (const o of state.ops) {
+    doc.getPage(o.page - 1).drawRectangle({ x: o.x, y: o.y, width: o.w, height: o.h, color: color(o.bg) });
+  }
+  for (const o of state.ops.filter(o => o.png)) {
+    const img = await doc.embedPng(o.png);
+    doc.getPage(o.page - 1).drawImage(img, { x: o.x + o.dx, y: o.y + o.dy, width: o.w, height: o.h });
+  }
   for (const e of state.edits.values()) {
     const page = doc.getPage(e.page - 1);
     const font = await getFont(e.font);
@@ -273,6 +514,8 @@ function zoom(delta) {
 }
 
 $('file').addEventListener('change', e => openFile(e.target.files[0]));
+$('modeText').addEventListener('click', () => setMode('text'));
+$('modeArea').addEventListener('click', () => setMode('area'));
 $('zoomIn').addEventListener('click', () => zoom(0.25));
 $('zoomOut').addEventListener('click', () => zoom(-0.25));
 $('undo').addEventListener('click', undo);
